@@ -35,6 +35,8 @@ SUPPORTED = {
     "t.co": "Twitter/X",
 }
 
+MAX_SIZE_MB = 49  # légèrement sous 50 Mo pour sécurité
+
 def detect_platform(url: str):
     for domain, name in SUPPORTED.items():
         if domain in url:
@@ -60,6 +62,67 @@ def get_video_resolution(video_path: Path) -> str:
     except Exception:
         pass
     return "HD"
+
+def get_duration(video_path: Path) -> float:
+    """Retourne la durée en secondes."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+def compress_video(input_path: Path, output_dir: Path) -> Path:
+    """
+    Compresse la vidéo pour qu'elle soit sous 49 Mo.
+    Calcule le bitrate optimal selon la durée.
+    """
+    output_path = output_dir / "compressed.mp4"
+    duration = get_duration(input_path)
+
+    if duration <= 0:
+        return None
+
+    # Calcul du bitrate cible (en kbps) pour tenir dans MAX_SIZE_MB
+    # taille_cible_bits = MAX_SIZE_MB * 8 * 1024 * 1024
+    # bitrate_total = taille / durée
+    target_bits = MAX_SIZE_MB * 8 * 1024 * 1024
+    total_bitrate = int(target_bits / duration)
+    audio_bitrate = 128  # kbps audio fixe
+    video_bitrate = max(200, (total_bitrate // 1000) - audio_bitrate)  # kbps vidéo
+
+    logger.info(f"Compression : durée={duration:.1f}s, bitrate vidéo cible={video_bitrate}k")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-b:v", f"{video_bitrate}k",
+        "-maxrate", f"{video_bitrate * 2}k",
+        "-bufsize", f"{video_bitrate * 4}k",
+        "-c:a", "aac",
+        "-b:a", f"{audio_bitrate}k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0 and output_path.exists():
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            logger.info(f"✅ Compressé : {size_mb:.1f} Mo")
+            return output_path
+        else:
+            logger.error(f"ffmpeg error: {result.stderr[:300]}")
+    except Exception as e:
+        logger.error(f"Compression échouée : {e}")
+
+    return None
 
 def find_file(output_dir: Path):
     try:
@@ -87,24 +150,15 @@ def run_ytdlp(cmd: list, timeout=300) -> bool:
 def download_video(url: str, output_dir: Path, platform: str):
     output_template = str(output_dir / "video.%(ext)s")
 
-    # Stratégies de téléchargement par ordre de priorité
     strategies = []
 
     if platform == "YouTube":
         strategies = [
-            # 1. Meilleure qualité HD/4K avec fusion ffmpeg
             ["yt-dlp", "--no-playlist", "--no-warnings",
              "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
-             "--merge-output-format", "mp4",
-             "-o", output_template, url],
-            # 2. Meilleur mp4 direct sans fusion
+             "--merge-output-format", "mp4", "-o", output_template, url],
             ["yt-dlp", "--no-playlist", "--no-warnings",
-             "-f", "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-             "-o", output_template, url],
-            # 3. Fallback simple
-            ["yt-dlp", "--no-playlist", "--no-warnings",
-             "-f", "best",
-             "-o", output_template, url],
+             "-f", "best[ext=mp4]/best", "-o", output_template, url],
         ]
     elif platform in ("Facebook", "Twitter/X"):
         for browser in ["chrome", "edge", "firefox"]:
@@ -115,7 +169,6 @@ def download_video(url: str, output_dir: Path, platform: str):
                 "--cookies-from-browser", browser,
                 "-o", output_template, url
             ])
-        # Fallback sans cookies
         strategies.append([
             "yt-dlp", "--no-playlist", "--no-warnings",
             "-f", "best", "-o", output_template, url
@@ -128,7 +181,6 @@ def download_video(url: str, output_dir: Path, platform: str):
             if f:
                 logger.info(f"✅ Téléchargé : {f.name}")
                 return f
-            # Nettoyer pour la prochaine tentative
         for f in output_dir.iterdir():
             try: f.unlink()
             except: pass
@@ -138,7 +190,7 @@ def download_video(url: str, output_dir: Path, platform: str):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
-        "Envoie-moi un lien et je télécharge la vidéo en *qualité maximale* (HD/4K) !\n\n"
+        "Envoie-moi un lien et je télécharge la vidéo en *qualité maximale* !\n\n"
         "✅ *Plateformes supportées :*\n"
         "• 🎬 YouTube\n"
         "• 📘 Facebook\n"
@@ -147,36 +199,17 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Aide*\n\n"
-        "1. Copie le lien d'une vidéo YouTube, Facebook ou Twitter\n"
-        "2. Colle-le dans ce chat\n"
-        "3. Reçois la vidéo en HD ou 4K 🎬\n\n"
-        "⚠️ *Limites :*\n"
-        "• Max 50 Mo (limite Telegram)\n"
-        "• Vidéos privées non accessibles",
-        parse_mode="Markdown",
-    )
-
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
     if not url.startswith("http"):
-        await update.message.reply_text(
-            "❌ Envoie un lien valide commençant par `http://` ou `https://`",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("❌ Envoie un lien valide commençant par `http://`", parse_mode="Markdown")
         return
 
     platform = detect_platform(url)
     if not platform:
         await update.message.reply_text(
-            "❌ *Plateforme non supportée*\n\n"
-            "J'accepte uniquement :\n"
-            "• 🎬 YouTube\n"
-            "• 📘 Facebook\n"
-            "• 🐦 Twitter / X",
+            "❌ *Plateforme non supportée*\n\nJ'accepte : YouTube, Facebook, Twitter/X",
             parse_mode="Markdown",
         )
         return
@@ -184,7 +217,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
     icon = icons.get(platform, "🎬")
 
-    msg = await update.message.reply_text(f"{icon} Téléchargement {platform} en HD/4K en cours...")
+    msg = await update.message.reply_text(f"{icon} Téléchargement {platform} en cours...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -193,10 +226,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not video_path:
             await msg.edit_text(
                 "❌ *Échec du téléchargement*\n\n"
-                "💡 *Causes possibles :*\n"
-                "• Vidéo privée ou supprimée\n"
-                "• Pour Facebook/Twitter : connecte-toi dans Chrome/Edge\n"
-                "• Lien incorrect ou vidéo trop longue",
+                "• Vidéo privée ou supprimée ?\n"
+                "• Lien incorrect ?\n"
+                "• Pour Facebook/Twitter : connecte-toi dans Chrome/Edge",
                 parse_mode="Markdown",
             )
             return
@@ -204,14 +236,23 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file_size_mb = video_path.stat().st_size / (1024 * 1024)
         resolution = get_video_resolution(video_path)
 
-        if file_size_mb > 50:
+        # Compression automatique si trop grand
+        if file_size_mb > MAX_SIZE_MB:
             await msg.edit_text(
-                f"⚠️ *Vidéo trop grande* ({file_size_mb:.1f} Mo)\n\n"
-                f"Résolution : {resolution}\n"
-                "Telegram limite à 50 Mo. Essaie une vidéo plus courte.",
-                parse_mode="Markdown",
+                f"📦 Vidéo originale : {file_size_mb:.1f} Mo ({resolution})\n"
+                f"⚙️ Compression automatique en cours..."
             )
-            return
+            compressed = compress_video(video_path, tmp)
+            if compressed:
+                video_path = compressed
+                file_size_mb = video_path.stat().st_size / (1024 * 1024)
+                resolution = resolution + " (compressé)"
+            else:
+                await msg.edit_text(
+                    f"⚠️ Vidéo trop grande ({file_size_mb:.1f} Mo) et compression échouée.\n"
+                    "Essaie avec une vidéo plus courte."
+                )
+                return
 
         await msg.edit_text(f"📤 Envoi en cours... ({resolution} — {file_size_mb:.1f} Mo)")
         try:
@@ -237,9 +278,8 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    logger.info("🤖 Video Downloader Bot HD/4K démarré !")
+    logger.info("🤖 Video Downloader Bot démarré !")
     app.run_polling(poll_interval=1.0, stop_signals=None)
 
 if __name__ == "__main__":
