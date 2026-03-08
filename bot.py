@@ -16,6 +16,7 @@ from telegram.ext import (
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "")
 
 if not BOT_TOKEN:
     print("❌ Token introuvable dans le fichier .env !")
@@ -35,8 +36,17 @@ SUPPORTED = {
     "t.co": "Twitter/X",
 }
 
-# Stockage temporaire des URLs en attente de choix
 pending_urls = {}
+
+# ── Écrire les cookies dans un fichier temporaire au démarrage ────────────────
+COOKIES_FILE = Path("/tmp/youtube_cookies.txt")
+
+def setup_cookies():
+    if YOUTUBE_COOKIES:
+        COOKIES_FILE.write_text(YOUTUBE_COOKIES)
+        logger.info("✅ Cookies YouTube chargés depuis variable d'environnement")
+    else:
+        logger.warning("⚠️ Pas de cookies YouTube — certaines vidéos peuvent échouer")
 
 def detect_platform(url: str):
     for domain, name in SUPPORTED.items():
@@ -64,50 +74,53 @@ def get_video_resolution(video_path: Path) -> str:
         pass
     return "HD"
 
-def run_ytdlp(cmd: list, timeout=300) -> tuple:
+def run_ytdlp(cmd: list, timeout=300) -> bool:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
-            return True, result.stdout
+            return True
         logger.error(f"yt-dlp stderr: {result.stderr[:300]}")
-        return False, result.stderr
     except Exception as e:
         logger.error(f"yt-dlp exception: {e}")
-        return False, str(e)
+    return False
 
-def get_extra_args(platform: str) -> list:
-    if platform in ("Facebook", "Twitter/X"):
+def get_cookies_args(platform: str) -> list:
+    """Retourne les arguments cookies selon la plateforme."""
+    args = []
+    # Cookies fichier pour YouTube
+    if platform == "YouTube" and COOKIES_FILE.exists():
+        args += ["--cookies", str(COOKIES_FILE)]
+    # Cookies navigateur pour Facebook/Twitter
+    elif platform in ("Facebook", "Twitter/X"):
         for browser in ["chrome", "edge", "firefox"]:
-            return ["--cookies-from-browser", browser]
-    return []
+            args += ["--cookies-from-browser", browser]
+            break
+    return args
 
-def dl_video_only(url: str, output_dir: Path, extra: list) -> Path:
-    """Télécharge uniquement la vidéo en HD max (sans audio)."""
+def dl_video_only(url: str, output_dir: Path, platform: str) -> Path:
     output_file = output_dir / "video.mp4"
-    # Format : meilleure vidéo HD >= 720p, sans audio
+    cookies = get_cookies_args(platform)
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/bestvideo[ext=mp4]/bestvideo",
         "-o", str(output_file),
-    ] + extra + [url]
-    ok, _ = run_ytdlp(cmd)
-    if ok and output_file.exists():
+    ] + cookies + [url]
+    if run_ytdlp(cmd) and output_file.exists():
         return output_file
     return None
 
-def dl_audio_only(url: str, output_dir: Path, extra: list) -> Path:
-    """Télécharge uniquement l'audio en haute qualité."""
+def dl_audio_only(url: str, output_dir: Path, platform: str) -> Path:
     output_m4a = output_dir / "audio.m4a"
     output_mp3 = output_dir / "audio.mp3"
+    cookies = get_cookies_args(platform)
 
     # Essai 1 : m4a
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestaudio[ext=m4a]/bestaudio",
         "-o", str(output_m4a),
-    ] + extra + [url]
-    ok, _ = run_ytdlp(cmd)
-    if ok and output_m4a.exists():
+    ] + cookies + [url]
+    if run_ytdlp(cmd) and output_m4a.exists():
         return output_m4a
 
     # Essai 2 : mp3
@@ -116,18 +129,10 @@ def dl_audio_only(url: str, output_dir: Path, extra: list) -> Path:
         "-f", "bestaudio",
         "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
         "-o", str(output_mp3),
-    ] + extra + [url]
-    ok2, _ = run_ytdlp(cmd2)
-    if ok2 and output_mp3.exists():
+    ] + cookies + [url]
+    if run_ytdlp(cmd2) and output_mp3.exists():
         return output_mp3
-
     return None
-
-def dl_video_and_audio(url: str, output_dir: Path, extra: list) -> tuple:
-    """Télécharge vidéo HD et audio séparément."""
-    video = dl_video_only(url, output_dir, extra)
-    audio = dl_audio_only(url, output_dir / ".." if False else output_dir, extra)
-    return video, audio
 
 async def send_video_file(update, video_path: Path, platform: str):
     size_mb = video_path.stat().st_size / (1024 * 1024)
@@ -159,16 +164,14 @@ async def send_audio_file(update, audio_path: Path, platform: str):
             parse_mode="Markdown",
         )
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
-
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
-        "Envoie-moi un lien de vidéo et choisis ce que tu veux télécharger :\n\n"
-        "🎥 *Vidéo HD* (sans audio)\n"
-        "🔊 *Audio seul* (haute qualité)\n"
-        "📦 *Vidéo + Audio* (deux fichiers séparés)\n\n"
-        "✅ *Plateformes supportées :*\n"
+        "Envoie-moi un lien et choisis ce que tu veux :\n\n"
+        "🎥 *Vidéo HD* — sans audio\n"
+        "🔊 *Audio seul* — haute qualité\n"
+        "📦 *Vidéo + Audio* — deux fichiers séparés\n\n"
+        "✅ *Plateformes :*\n"
         "• 🎬 YouTube\n"
         "• 📘 Facebook\n"
         "• 🐦 Twitter / X",
@@ -177,7 +180,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-
     if not url.startswith("http"):
         await update.message.reply_text("❌ Envoie un lien valide commençant par `http://`", parse_mode="Markdown")
         return
@@ -190,7 +192,6 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Stocker l'URL en attente du choix de l'utilisateur
     user_id = update.message.from_user.id
     pending_urls[user_id] = {"url": url, "platform": platform}
 
@@ -198,22 +199,14 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     icon = icons.get(platform, "🎬")
 
     keyboard = [
-        [
-            InlineKeyboardButton("🎥 Vidéo HD seulement", callback_data="video_only"),
-        ],
-        [
-            InlineKeyboardButton("🔊 Audio seulement", callback_data="audio_only"),
-        ],
-        [
-            InlineKeyboardButton("📦 Vidéo HD + Audio", callback_data="both"),
-        ],
+        [InlineKeyboardButton("🎥 Vidéo HD seulement", callback_data="video_only")],
+        [InlineKeyboardButton("🔊 Audio seulement", callback_data="audio_only")],
+        [InlineKeyboardButton("📦 Vidéo HD + Audio (séparés)", callback_data="both")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
         f"{icon} *{platform}* détecté !\n\nQue veux-tu télécharger ?",
         parse_mode="Markdown",
-        reply_markup=reply_markup,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -230,23 +223,21 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = pending_urls.pop(user_id)
     url = data["url"]
     platform = data["platform"]
-    extra = get_extra_args(platform)
-
     icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
     icon = icons.get(platform, "🎬")
 
     labels = {
         "video_only": "🎥 Vidéo HD",
         "audio_only": "🔊 Audio",
-        "both": "📦 Vidéo HD + Audio",
+        "both": "📦 Vidéo + Audio",
     }
-    await query.edit_message_text(f"⏳ Téléchargement {labels.get(choice, '')} {icon} en cours...")
+    await query.edit_message_text(f"⏳ Téléchargement {labels.get(choice)} {icon} en cours...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
         if choice == "video_only":
-            video = dl_video_only(url, tmp, extra)
+            video = dl_video_only(url, tmp, platform)
             if not video:
                 await query.edit_message_text("❌ Échec du téléchargement vidéo.")
                 return
@@ -255,7 +246,7 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.delete_message()
 
         elif choice == "audio_only":
-            audio = dl_audio_only(url, tmp, extra)
+            audio = dl_audio_only(url, tmp, platform)
             if not audio:
                 await query.edit_message_text("❌ Échec du téléchargement audio.")
                 return
@@ -265,10 +256,9 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         elif choice == "both":
             await query.edit_message_text("⏳ Téléchargement vidéo HD...")
-            video = dl_video_only(url, tmp, extra)
-
+            video = dl_video_only(url, tmp, platform)
             await query.edit_message_text("⏳ Téléchargement audio...")
-            audio = dl_audio_only(url, tmp, extra)
+            audio = dl_audio_only(url, tmp, platform)
 
             if not video and not audio:
                 await query.edit_message_text("❌ Échec du téléchargement.")
@@ -277,17 +267,12 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📤 Envoi des fichiers...")
             if video:
                 await send_video_file(query, video, platform)
-            else:
-                await query.message.reply_text("⚠️ Vidéo non disponible")
-
             if audio:
                 await send_audio_file(query, audio, platform)
-            else:
-                await query.message.reply_text("⚠️ Audio non disponible")
-
             await query.delete_message()
 
 def main():
+    setup_cookies()
     app = (
         Application.builder()
         .token(BOT_TOKEN)
