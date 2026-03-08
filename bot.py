@@ -62,6 +62,21 @@ def get_video_resolution(video_path: Path) -> str:
         pass
     return "HD"
 
+def check_has_audio(video_path: Path) -> bool:
+    """Vérifie si la vidéo contient un flux audio."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=10
+        )
+        has = result.returncode == 0 and "audio" in result.stdout
+        logger.info(f"Audio présent dans le fichier : {has}")
+        return has
+    except Exception as e:
+        logger.error(f"Vérif audio échouée : {e}")
+        return False
+
 def get_duration(video_path: Path) -> float:
     try:
         result = subprocess.run(
@@ -75,28 +90,47 @@ def get_duration(video_path: Path) -> float:
         pass
     return 0
 
-def merge_video_audio(video_file: Path, audio_file: Path, output: Path) -> bool:
-    """Fusionne vidéo + audio avec ffmpeg."""
-    cmd = [
+def add_audio_to_video(video_path: Path, url: str, output_dir: Path, extra_args: list) -> Path:
+    """Télécharge l'audio séparément et le fusionne avec la vidéo existante."""
+    audio_file = output_dir / "audio_only.m4a"
+    final_file = output_dir / "final_with_audio.mp4"
+
+    # Télécharger l'audio seul
+    cmd_audio = [
+        "yt-dlp", "--no-playlist", "--no-warnings",
+        "-f", "bestaudio[ext=m4a]/bestaudio",
+        "-o", str(audio_file),
+    ] + extra_args + [url]
+
+    logger.info("🔊 Téléchargement audio séparé...")
+    res = subprocess.run(cmd_audio, capture_output=True, text=True, timeout=300)
+    
+    if res.returncode != 0 or not audio_file.exists():
+        logger.error(f"Audio téléchargement échoué: {res.stderr[:200]}")
+        return video_path  # retourner vidéo sans audio plutôt que rien
+
+    # Fusionner avec ffmpeg
+    cmd_merge = [
         "ffmpeg", "-y",
-        "-i", str(video_file),
+        "-i", str(video_path),
         "-i", str(audio_file),
         "-c:v", "copy",
         "-c:a", "aac",
-        "-ac", "2",
         "-b:a", "192k",
+        "-ac", "2",
         "-movflags", "+faststart",
-        str(output)
+        str(final_file)
     ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and output.exists():
-            logger.info(f"✅ Fusion OK : {output.stat().st_size / 1024 / 1024:.1f} Mo")
-            return True
-        logger.error(f"ffmpeg fusion error: {result.stderr[:300]}")
-    except Exception as e:
-        logger.error(f"Fusion échouée : {e}")
-    return False
+
+    logger.info("🔗 Fusion vidéo + audio...")
+    res_m = subprocess.run(cmd_merge, capture_output=True, text=True, timeout=300)
+    
+    if res_m.returncode == 0 and final_file.exists():
+        logger.info(f"✅ Fusion réussie : {final_file.stat().st_size / 1024 / 1024:.1f} Mo")
+        return final_file
+    
+    logger.error(f"Fusion échouée: {res_m.stderr[:300]}")
+    return video_path
 
 def compress_video(input_path: Path, output_dir: Path) -> Path:
     output_path = output_dir / "compressed.mp4"
@@ -132,69 +166,48 @@ def compress_video(input_path: Path, output_dir: Path) -> Path:
     return None
 
 def download_video(url: str, output_dir: Path, platform: str) -> Path:
-    """
-    Télécharge vidéo et audio séparément puis les fusionne avec ffmpeg.
-    """
-    video_file = output_dir / "video_only.mp4"
-    audio_file = output_dir / "audio_only.m4a"
-    final_file = output_dir / "final.mp4"
+    output_file = output_dir / "video.mp4"
 
     extra = []
     if platform in ("Facebook", "Twitter/X"):
         for browser in ["chrome", "edge", "firefox"]:
             extra = ["--cookies-from-browser", browser]
-            break  # on essaie chrome en premier
+            break
 
-    # ── Étape 1 : télécharger la meilleure vidéo (sans audio) ──
-    cmd_video = [
-        "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", "bestvideo[ext=mp4]/bestvideo",
-        "-o", str(video_file),
+    # ── Approche unique : laisser yt-dlp choisir le meilleur format avec audio ──
+    # On NE force PAS de format spécifique pour éviter de prendre vidéo sans audio
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--merge-output-format", "mp4",
+        "-o", str(output_file),
     ] + extra + [url]
 
-    logger.info("📥 Téléchargement vidéo (flux vidéo)...")
-    res_v = subprocess.run(cmd_video, capture_output=True, text=True, timeout=300)
-    if res_v.returncode != 0 or not video_file.exists():
-        logger.warning(f"Flux vidéo échoué, fallback best... stderr: {res_v.stderr[:200]}")
-        # Fallback : télécharger best directement (vidéo+audio ensemble)
-        cmd_best = [
-            "yt-dlp", "--no-playlist", "--no-warnings",
-            "-f", "best[ext=mp4]/best",
-            "-o", str(final_file),
-        ] + extra + [url]
-        res_b = subprocess.run(cmd_best, capture_output=True, text=True, timeout=300)
-        if res_b.returncode == 0 and final_file.exists():
-            logger.info("✅ Téléchargé via fallback best")
-            return final_file
+    logger.info(f"📥 Téléchargement {platform} (format auto avec audio)...")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    logger.info(f"yt-dlp stdout: {result.stdout[:300]}")
+    logger.info(f"yt-dlp stderr: {result.stderr[:300]}")
+
+    if result.returncode != 0 or not output_file.exists():
+        logger.error("Téléchargement échoué")
         return None
 
-    # ── Étape 2 : télécharger le meilleur audio ──
-    cmd_audio = [
-        "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", "bestaudio[ext=m4a]/bestaudio",
-        "-o", str(audio_file),
-    ] + extra + [url]
+    logger.info(f"✅ Fichier téléchargé : {output_file.stat().st_size / 1024 / 1024:.1f} Mo")
 
-    logger.info("🔊 Téléchargement audio (flux audio)...")
-    res_a = subprocess.run(cmd_audio, capture_output=True, text=True, timeout=300)
-    if res_a.returncode != 0 or not audio_file.exists():
-        logger.warning("Flux audio échoué")
-        # Retourner la vidéo seule si l'audio échoue
-        return video_file if video_file.exists() else None
+    # ── Vérifier si l'audio est présent ──
+    if not check_has_audio(output_file):
+        logger.warning("⚠️ Pas d'audio détecté — ajout de l'audio séparément...")
+        output_file = add_audio_to_video(output_file, url, output_dir, extra)
 
-    # ── Étape 3 : fusionner vidéo + audio ──
-    logger.info("🔗 Fusion vidéo + audio...")
-    if merge_video_audio(video_file, audio_file, final_file):
-        return final_file
-
-    # Si fusion échoue, retourner la vidéo seule
-    return video_file if video_file.exists() else None
+    return output_file
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
-        "Envoie-moi un lien et je télécharge la vidéo en *qualité maximale avec son* !\n\n"
+        "Envoie-moi un lien et je télécharge la vidéo avec son !\n\n"
         "✅ *Plateformes supportées :*\n"
         "• 🎬 YouTube\n"
         "• 📘 Facebook\n"
@@ -220,7 +233,6 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
     icon = icons.get(platform, "🎬")
-
     msg = await update.message.reply_text(f"{icon} Téléchargement {platform} en cours...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,8 +243,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(
                 "❌ *Échec du téléchargement*\n\n"
                 "• Vidéo privée ou supprimée ?\n"
-                "• Lien incorrect ?\n"
-                "• Pour Facebook/Twitter : connecte-toi dans Chrome/Edge",
+                "• Lien incorrect ?",
                 parse_mode="Markdown",
             )
             return
@@ -240,22 +251,18 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file_size_mb = video_path.stat().st_size / (1024 * 1024)
         resolution = get_video_resolution(video_path)
 
-        # Compression si trop grand
         if file_size_mb > MAX_SIZE_MB:
-            await msg.edit_text(
-                f"📦 Vidéo originale : {file_size_mb:.1f} Mo ({resolution})\n"
-                "⚙️ Compression en cours (son conservé)..."
-            )
+            await msg.edit_text(f"📦 {file_size_mb:.1f} Mo détectés — compression en cours...")
             compressed = compress_video(video_path, tmp)
             if compressed:
                 video_path = compressed
                 file_size_mb = video_path.stat().st_size / (1024 * 1024)
                 resolution = resolution + " (compressé)"
             else:
-                await msg.edit_text(f"⚠️ Vidéo trop grande ({file_size_mb:.1f} Mo) et compression échouée.")
+                await msg.edit_text(f"⚠️ Vidéo trop grande ({file_size_mb:.1f} Mo), compression échouée.")
                 return
 
-        await msg.edit_text(f"📤 Envoi en cours... ({resolution} — {file_size_mb:.1f} Mo)")
+        await msg.edit_text(f"📤 Envoi... ({resolution} — {file_size_mb:.1f} Mo)")
         try:
             with open(video_path, "rb") as vf:
                 await update.message.reply_video(
