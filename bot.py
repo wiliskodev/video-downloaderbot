@@ -1,5 +1,4 @@
 import os
-import asyncio
 import logging
 import tempfile
 import subprocess
@@ -35,7 +34,7 @@ SUPPORTED = {
     "t.co": "Twitter/X",
 }
 
-MAX_SIZE_MB = 49  # légèrement sous 50 Mo pour sécurité
+MAX_SIZE_MB = 49
 
 def detect_platform(url: str):
     for domain, name in SUPPORTED.items():
@@ -64,7 +63,6 @@ def get_video_resolution(video_path: Path) -> str:
     return "HD"
 
 def get_duration(video_path: Path) -> float:
-    """Retourne la durée en secondes."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -78,25 +76,17 @@ def get_duration(video_path: Path) -> float:
     return 0
 
 def compress_video(input_path: Path, output_dir: Path) -> Path:
-    """
-    Compresse la vidéo pour qu'elle soit sous 49 Mo.
-    Calcule le bitrate optimal selon la durée.
-    """
     output_path = output_dir / "compressed.mp4"
     duration = get_duration(input_path)
-
     if duration <= 0:
         return None
 
-    # Calcul du bitrate cible (en kbps) pour tenir dans MAX_SIZE_MB
-    # taille_cible_bits = MAX_SIZE_MB * 8 * 1024 * 1024
-    # bitrate_total = taille / durée
     target_bits = MAX_SIZE_MB * 8 * 1024 * 1024
     total_bitrate = int(target_bits / duration)
-    audio_bitrate = 128  # kbps audio fixe
-    video_bitrate = max(200, (total_bitrate // 1000) - audio_bitrate)  # kbps vidéo
+    audio_bitrate = 128
+    video_bitrate = max(200, (total_bitrate // 1000) - audio_bitrate)
 
-    logger.info(f"Compression : durée={duration:.1f}s, bitrate vidéo cible={video_bitrate}k")
+    logger.info(f"Compression : durée={duration:.1f}s, bitrate vidéo={video_bitrate}k")
 
     cmd = [
         "ffmpeg", "-y",
@@ -105,8 +95,9 @@ def compress_video(input_path: Path, output_dir: Path) -> Path:
         "-b:v", f"{video_bitrate}k",
         "-maxrate", f"{video_bitrate * 2}k",
         "-bufsize", f"{video_bitrate * 4}k",
-        "-c:a", "aac",
+        "-c:a", "aac",        # audio AAC
         "-b:a", f"{audio_bitrate}k",
+        "-ac", "2",           # stéréo
         "-movflags", "+faststart",
         str(output_path)
     ]
@@ -114,14 +105,11 @@ def compress_video(input_path: Path, output_dir: Path) -> Path:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode == 0 and output_path.exists():
-            size_mb = output_path.stat().st_size / (1024 * 1024)
-            logger.info(f"✅ Compressé : {size_mb:.1f} Mo")
+            logger.info(f"✅ Compressé : {output_path.stat().st_size / 1024 / 1024:.1f} Mo")
             return output_path
-        else:
-            logger.error(f"ffmpeg error: {result.stderr[:300]}")
+        logger.error(f"ffmpeg error: {result.stderr[:300]}")
     except Exception as e:
         logger.error(f"Compression échouée : {e}")
-
     return None
 
 def find_file(output_dir: Path):
@@ -139,58 +127,72 @@ def run_ytdlp(cmd: list, timeout=300) -> bool:
         if result.returncode == 0:
             return True
         logger.warning("yt-dlp stderr: %s", result.stderr[:300])
-        return False
     except subprocess.TimeoutExpired:
         logger.error("Timeout yt-dlp")
-        return False
     except Exception as e:
         logger.error("Exception yt-dlp: %s", e)
-        return False
+    return False
 
 def download_video(url: str, output_dir: Path, platform: str):
     output_template = str(output_dir / "video.%(ext)s")
 
+    # ⚠️ Clé : on force toujours bestvideo+bestaudio pour avoir le son
     strategies = []
 
     if platform == "YouTube":
         strategies = [
+            # Stratégie 1 : meilleure vidéo + meilleur audio → fusionnés en mp4
             ["yt-dlp", "--no-playlist", "--no-warnings",
-             "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
-             "--merge-output-format", "mp4", "-o", output_template, url],
+             "-f", "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/bestvideo+bestaudio",
+             "--merge-output-format", "mp4",
+             "--postprocessor-args", "ffmpeg:-c:a aac -ac 2",
+             "-o", output_template, url],
+            # Stratégie 2 : mp4 avec audio intégré
             ["yt-dlp", "--no-playlist", "--no-warnings",
-             "-f", "best[ext=mp4]/best", "-o", output_template, url],
+             "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+             "--merge-output-format", "mp4",
+             "--postprocessor-args", "ffmpeg:-c:a aac -ac 2",
+             "-o", output_template, url],
+            # Stratégie 3 : fallback best avec audio garanti
+            ["yt-dlp", "--no-playlist", "--no-warnings",
+             "-f", "best",
+             "--merge-output-format", "mp4",
+             "-o", output_template, url],
         ]
     elif platform in ("Facebook", "Twitter/X"):
         for browser in ["chrome", "edge", "firefox"]:
             strategies.append([
                 "yt-dlp", "--no-playlist", "--no-warnings",
-                "-f", "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                "-f", "bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
+                "--postprocessor-args", "ffmpeg:-c:a aac -ac 2",
                 "--cookies-from-browser", browser,
                 "-o", output_template, url
             ])
         strategies.append([
             "yt-dlp", "--no-playlist", "--no-warnings",
-            "-f", "best", "-o", output_template, url
+            "-f", "best", "--merge-output-format", "mp4",
+            "-o", output_template, url
         ])
 
     for i, cmd in enumerate(strategies):
         logger.info(f"Stratégie {i+1}/{len(strategies)} pour {platform}...")
+        # Nettoyer avant chaque tentative
+        for f in output_dir.iterdir():
+            try: f.unlink()
+            except: pass
         if run_ytdlp(cmd):
             f = find_file(output_dir)
             if f:
                 logger.info(f"✅ Téléchargé : {f.name}")
                 return f
-        for f in output_dir.iterdir():
-            try: f.unlink()
-            except: pass
 
     return None
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
-        "Envoie-moi un lien et je télécharge la vidéo en *qualité maximale* !\n\n"
+        "Envoie-moi un lien et je télécharge la vidéo en *qualité maximale avec son* !\n\n"
         "✅ *Plateformes supportées :*\n"
         "• 🎬 YouTube\n"
         "• 📘 Facebook\n"
@@ -236,11 +238,10 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file_size_mb = video_path.stat().st_size / (1024 * 1024)
         resolution = get_video_resolution(video_path)
 
-        # Compression automatique si trop grand
         if file_size_mb > MAX_SIZE_MB:
             await msg.edit_text(
                 f"📦 Vidéo originale : {file_size_mb:.1f} Mo ({resolution})\n"
-                f"⚙️ Compression automatique en cours..."
+                "⚙️ Compression en cours (son conservé)..."
             )
             compressed = compress_video(video_path, tmp)
             if compressed:
@@ -248,10 +249,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 file_size_mb = video_path.stat().st_size / (1024 * 1024)
                 resolution = resolution + " (compressé)"
             else:
-                await msg.edit_text(
-                    f"⚠️ Vidéo trop grande ({file_size_mb:.1f} Mo) et compression échouée.\n"
-                    "Essaie avec une vidéo plus courte."
-                )
+                await msg.edit_text(f"⚠️ Vidéo trop grande ({file_size_mb:.1f} Mo) et compression échouée.")
                 return
 
         await msg.edit_text(f"📤 Envoi en cours... ({resolution} — {file_size_mb:.1f} Mo)")
