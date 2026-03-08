@@ -4,11 +4,12 @@ import tempfile
 import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -33,6 +34,9 @@ SUPPORTED = {
     "x.com": "Twitter/X",
     "t.co": "Twitter/X",
 }
+
+# Stockage temporaire des URLs en attente de choix
+pending_urls = {}
 
 def detect_platform(url: str):
     for domain, name in SUPPORTED.items():
@@ -60,62 +64,114 @@ def get_video_resolution(video_path: Path) -> str:
         pass
     return "HD"
 
-def run_ytdlp(cmd: list, timeout=300) -> bool:
+def run_ytdlp(cmd: list, timeout=300) -> tuple:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
-            return True
+            return True, result.stdout
         logger.error(f"yt-dlp stderr: {result.stderr[:300]}")
+        return False, result.stderr
     except Exception as e:
         logger.error(f"yt-dlp exception: {e}")
-    return False
+        return False, str(e)
 
-def download_video_only(url: str, output_dir: Path, extra: list) -> Path:
+def get_extra_args(platform: str) -> list:
+    if platform in ("Facebook", "Twitter/X"):
+        for browser in ["chrome", "edge", "firefox"]:
+            return ["--cookies-from-browser", browser]
+    return []
+
+def dl_video_only(url: str, output_dir: Path, extra: list) -> Path:
+    """Télécharge uniquement la vidéo en HD max (sans audio)."""
     output_file = output_dir / "video.mp4"
+    # Format : meilleure vidéo HD >= 720p, sans audio
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", "bestvideo[ext=mp4]/bestvideo",
+        "-f", "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/bestvideo[ext=mp4]/bestvideo",
         "-o", str(output_file),
     ] + extra + [url]
-    logger.info("📥 Téléchargement flux vidéo...")
-    if run_ytdlp(cmd) and output_file.exists():
+    ok, _ = run_ytdlp(cmd)
+    if ok and output_file.exists():
         return output_file
     return None
 
-def download_audio_only(url: str, output_dir: Path, extra: list) -> Path:
-    output_file = output_dir / "audio.m4a"
+def dl_audio_only(url: str, output_dir: Path, extra: list) -> Path:
+    """Télécharge uniquement l'audio en haute qualité."""
+    output_m4a = output_dir / "audio.m4a"
+    output_mp3 = output_dir / "audio.mp3"
+
+    # Essai 1 : m4a
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestaudio[ext=m4a]/bestaudio",
-        "-o", str(output_file),
+        "-o", str(output_m4a),
     ] + extra + [url]
-    logger.info("🔊 Téléchargement flux audio...")
-    if run_ytdlp(cmd) and output_file.exists():
-        return output_file
-    # Essai alternatif en mp3
-    output_mp3 = output_dir / "audio.mp3"
+    ok, _ = run_ytdlp(cmd)
+    if ok and output_m4a.exists():
+        return output_m4a
+
+    # Essai 2 : mp3
     cmd2 = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestaudio",
-        "--extract-audio", "--audio-format", "mp3",
+        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
         "-o", str(output_mp3),
     ] + extra + [url]
-    if run_ytdlp(cmd2) and output_mp3.exists():
+    ok2, _ = run_ytdlp(cmd2)
+    if ok2 and output_mp3.exists():
         return output_mp3
+
     return None
 
+def dl_video_and_audio(url: str, output_dir: Path, extra: list) -> tuple:
+    """Télécharge vidéo HD et audio séparément."""
+    video = dl_video_only(url, output_dir, extra)
+    audio = dl_audio_only(url, output_dir / ".." if False else output_dir, extra)
+    return video, audio
+
+async def send_video_file(update, video_path: Path, platform: str):
+    size_mb = video_path.stat().st_size / (1024 * 1024)
+    resolution = get_video_resolution(video_path)
+    icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
+    icon = icons.get(platform, "🎬")
+    if size_mb > 50:
+        await update.message.reply_text(f"⚠️ Vidéo trop grande ({size_mb:.1f} Mo > 50 Mo Telegram)")
+        return
+    with open(video_path, "rb") as vf:
+        await update.message.reply_video(
+            video=vf,
+            caption=f"🎥 *Vidéo sans audio* {icon}\n{resolution} — {size_mb:.1f} Mo",
+            parse_mode="Markdown",
+            supports_streaming=True,
+        )
+
+async def send_audio_file(update, audio_path: Path, platform: str):
+    size_mb = audio_path.stat().st_size / (1024 * 1024)
+    icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
+    icon = icons.get(platform, "🎬")
+    if size_mb > 50:
+        await update.message.reply_text(f"⚠️ Audio trop grand ({size_mb:.1f} Mo > 50 Mo Telegram)")
+        return
+    with open(audio_path, "rb") as af:
+        await update.message.reply_audio(
+            audio=af,
+            caption=f"🔊 *Audio haute qualité* {icon}\n{size_mb:.1f} Mo",
+            parse_mode="Markdown",
+        )
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
-        "Envoie-moi un lien et je t'envoie :\n"
-        "🎥 *Fichier vidéo* (sans audio, haute qualité)\n"
-        "🔊 *Fichier audio* (haute qualité)\n\n"
+        "Envoie-moi un lien de vidéo et choisis ce que tu veux télécharger :\n\n"
+        "🎥 *Vidéo HD* (sans audio)\n"
+        "🔊 *Audio seul* (haute qualité)\n"
+        "📦 *Vidéo + Audio* (deux fichiers séparés)\n\n"
         "✅ *Plateformes supportées :*\n"
         "• 🎬 YouTube\n"
         "• 📘 Facebook\n"
-        "• 🐦 Twitter / X\n\n"
-        "📌 Colle simplement le lien ici 👇",
+        "• 🐦 Twitter / X",
         parse_mode="Markdown",
     )
 
@@ -134,71 +190,102 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Stocker l'URL en attente du choix de l'utilisateur
+    user_id = update.message.from_user.id
+    pending_urls[user_id] = {"url": url, "platform": platform}
+
     icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
     icon = icons.get(platform, "🎬")
-    msg = await update.message.reply_text(f"{icon} Téléchargement {platform} en cours...")
 
-    extra = []
-    if platform in ("Facebook", "Twitter/X"):
-        for browser in ["chrome", "edge", "firefox"]:
-            extra = ["--cookies-from-browser", browser]
-            break
+    keyboard = [
+        [
+            InlineKeyboardButton("🎥 Vidéo HD seulement", callback_data="video_only"),
+        ],
+        [
+            InlineKeyboardButton("🔊 Audio seulement", callback_data="audio_only"),
+        ],
+        [
+            InlineKeyboardButton("📦 Vidéo HD + Audio", callback_data="both"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"{icon} *{platform}* détecté !\n\nQue veux-tu télécharger ?",
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+    )
+
+async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    choice = query.data
+
+    if user_id not in pending_urls:
+        await query.edit_message_text("❌ Session expirée. Renvoie le lien.")
+        return
+
+    data = pending_urls.pop(user_id)
+    url = data["url"]
+    platform = data["platform"]
+    extra = get_extra_args(platform)
+
+    icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
+    icon = icons.get(platform, "🎬")
+
+    labels = {
+        "video_only": "🎥 Vidéo HD",
+        "audio_only": "🔊 Audio",
+        "both": "📦 Vidéo HD + Audio",
+    }
+    await query.edit_message_text(f"⏳ Téléchargement {labels.get(choice, '')} {icon} en cours...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
-        # ── Téléchargement vidéo ──
-        await msg.edit_text("📥 Téléchargement de la vidéo (sans audio)...")
-        video_path = download_video_only(url, tmp, extra)
+        if choice == "video_only":
+            video = dl_video_only(url, tmp, extra)
+            if not video:
+                await query.edit_message_text("❌ Échec du téléchargement vidéo.")
+                return
+            await query.edit_message_text("📤 Envoi de la vidéo...")
+            await send_video_file(query, video, platform)
+            await query.delete_message()
 
-        # ── Téléchargement audio ──
-        await msg.edit_text("🔊 Téléchargement de l'audio...")
-        audio_path = download_audio_only(url, tmp, extra)
+        elif choice == "audio_only":
+            audio = dl_audio_only(url, tmp, extra)
+            if not audio:
+                await query.edit_message_text("❌ Échec du téléchargement audio.")
+                return
+            await query.edit_message_text("📤 Envoi de l'audio...")
+            await send_audio_file(query, audio, platform)
+            await query.delete_message()
 
-        if not video_path and not audio_path:
-            await msg.edit_text(
-                "❌ *Échec du téléchargement*\n\n"
-                "• Vidéo privée ou supprimée ?\n"
-                "• Lien incorrect ?",
-                parse_mode="Markdown",
-            )
-            return
+        elif choice == "both":
+            await query.edit_message_text("⏳ Téléchargement vidéo HD...")
+            video = dl_video_only(url, tmp, extra)
 
-        await msg.edit_text("📤 Envoi des fichiers...")
+            await query.edit_message_text("⏳ Téléchargement audio...")
+            audio = dl_audio_only(url, tmp, extra)
 
-        # ── Envoyer la vidéo ──
-        if video_path and video_path.exists():
-            size_mb = video_path.stat().st_size / (1024 * 1024)
-            resolution = get_video_resolution(video_path)
-            if size_mb <= 50:
-                with open(video_path, "rb") as vf:
-                    await update.message.reply_video(
-                        video=vf,
-                        caption=f"🎥 *Vidéo sans audio* — {resolution}\n_{size_mb:.1f} Mo_",
-                        parse_mode="Markdown",
-                        supports_streaming=True,
-                    )
+            if not video and not audio:
+                await query.edit_message_text("❌ Échec du téléchargement.")
+                return
+
+            await query.edit_message_text("📤 Envoi des fichiers...")
+            if video:
+                await send_video_file(query, video, platform)
             else:
-                await update.message.reply_text(f"⚠️ Vidéo trop grande ({size_mb:.1f} Mo > 50 Mo Telegram)")
-        else:
-            await update.message.reply_text("⚠️ Vidéo non disponible")
+                await query.message.reply_text("⚠️ Vidéo non disponible")
 
-        # ── Envoyer l'audio ──
-        if audio_path and audio_path.exists():
-            size_mb = audio_path.stat().st_size / (1024 * 1024)
-            if size_mb <= 50:
-                with open(audio_path, "rb") as af:
-                    await update.message.reply_audio(
-                        audio=af,
-                        caption=f"🔊 *Audio haute qualité*\n_{size_mb:.1f} Mo_",
-                        parse_mode="Markdown",
-                    )
+            if audio:
+                await send_audio_file(query, audio, platform)
             else:
-                await update.message.reply_text(f"⚠️ Audio trop grand ({size_mb:.1f} Mo > 50 Mo Telegram)")
-        else:
-            await update.message.reply_text("⚠️ Audio non disponible")
+                await query.message.reply_text("⚠️ Audio non disponible")
 
-        await msg.delete()
+            await query.delete_message()
 
 def main():
     app = (
@@ -212,6 +299,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(handle_choice))
     logger.info("🤖 Video Downloader Bot démarré !")
     app.run_polling(poll_interval=1.0, stop_signals=None)
 
