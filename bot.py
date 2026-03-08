@@ -42,7 +42,6 @@ def detect_platform(url: str):
     return None
 
 def get_video_resolution(video_path: Path) -> str:
-    """Détecte la résolution de la vidéo téléchargée."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -52,7 +51,7 @@ def get_video_resolution(video_path: Path) -> str:
         if result.returncode == 0 and result.stdout.strip():
             parts = result.stdout.strip().split(",")
             if len(parts) == 2:
-                w, h = int(parts[0]), int(parts[1])
+                h = int(parts[1])
                 if h >= 2160: return "4K 🔥"
                 elif h >= 1440: return "2K ✨"
                 elif h >= 1080: return "Full HD 1080p ⚡"
@@ -62,61 +61,77 @@ def get_video_resolution(video_path: Path) -> str:
         pass
     return "HD"
 
+def find_file(output_dir: Path):
+    try:
+        files = [f for f in output_dir.iterdir() if f.suffix in (".mp4", ".webm", ".mov", ".mkv")]
+        if files:
+            return max(files, key=lambda x: x.stat().st_mtime)
+    except Exception:
+        pass
+    return None
+
+def run_ytdlp(cmd: list, timeout=300) -> bool:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            return True
+        logger.warning("yt-dlp stderr: %s", result.stderr[:300])
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout yt-dlp")
+        return False
+    except Exception as e:
+        logger.error("Exception yt-dlp: %s", e)
+        return False
+
 def download_video(url: str, output_dir: Path, platform: str):
     output_template = str(output_dir / "video.%(ext)s")
 
-    # Format HD/4K max qualité : meilleure vidéo + meilleur audio fusionnés en mp4
-    format_selector = (
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo[ext=mp4]+bestaudio/"
-        "bestvideo+bestaudio/"
-        "best"
-    )
+    # Stratégies de téléchargement par ordre de priorité
+    strategies = []
 
-    base_cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "-f", format_selector,
-        "--merge-output-format", "mp4",
-        "--remux-video", "mp4",
-        "-o", output_template,
-    ]
-
-    def find_file():
-        for f in sorted(output_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if f.suffix in (".mp4", ".webm", ".mov", ".mkv"):
-                return f
-        return None
-
-    # Facebook et Twitter nécessitent des cookies
-    if platform in ("Facebook", "Twitter/X"):
+    if platform == "YouTube":
+        strategies = [
+            # 1. Meilleure qualité HD/4K avec fusion ffmpeg
+            ["yt-dlp", "--no-playlist", "--no-warnings",
+             "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+             "--merge-output-format", "mp4",
+             "-o", output_template, url],
+            # 2. Meilleur mp4 direct sans fusion
+            ["yt-dlp", "--no-playlist", "--no-warnings",
+             "-f", "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+             "-o", output_template, url],
+            # 3. Fallback simple
+            ["yt-dlp", "--no-playlist", "--no-warnings",
+             "-f", "best",
+             "-o", output_template, url],
+        ]
+    elif platform in ("Facebook", "Twitter/X"):
         for browser in ["chrome", "edge", "firefox"]:
-            try:
-                cmd = base_cmd + ["--cookies-from-browser", browser, url]
-                logger.info(f"Tentative {platform} avec cookies {browser}...")
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                if result.returncode == 0:
-                    f = find_file()
-                    if f:
-                        logger.info(f"✅ {platform} téléchargé via {browser}")
-                        return f
-            except Exception as e:
-                logger.warning(f"{browser} échoué : {e}")
+            strategies.append([
+                "yt-dlp", "--no-playlist", "--no-warnings",
+                "-f", "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "--cookies-from-browser", browser,
+                "-o", output_template, url
+            ])
+        # Fallback sans cookies
+        strategies.append([
+            "yt-dlp", "--no-playlist", "--no-warnings",
+            "-f", "best", "-o", output_template, url
+        ])
 
-    # YouTube ou fallback sans cookies
-    try:
-        cmd = base_cmd + [url]
-        logger.info(f"Téléchargement {platform} sans cookies...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            f = find_file()
+    for i, cmd in enumerate(strategies):
+        logger.info(f"Stratégie {i+1}/{len(strategies)} pour {platform}...")
+        if run_ytdlp(cmd):
+            f = find_file(output_dir)
             if f:
+                logger.info(f"✅ Téléchargé : {f.name}")
                 return f
-        else:
-            logger.error("yt-dlp stderr: %s", result.stderr[:400])
-    except Exception as e:
-        logger.error(f"Erreur download : {e}")
+            # Nettoyer pour la prochaine tentative
+        for f in output_dir.iterdir():
+            try: f.unlink()
+            except: pass
 
     return None
 
@@ -137,11 +152,10 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📖 *Aide*\n\n"
         "1. Copie le lien d'une vidéo YouTube, Facebook ou Twitter\n"
         "2. Colle-le dans ce chat\n"
-        "3. Reçois la vidéo en HD ou 4K automatiquement 🎬\n\n"
+        "3. Reçois la vidéo en HD ou 4K 🎬\n\n"
         "⚠️ *Limites :*\n"
         "• Max 50 Mo (limite Telegram)\n"
-        "• Vidéos privées non accessibles\n"
-        "• Pour Facebook/Twitter : être connecté dans Chrome ou Edge",
+        "• Vidéos privées non accessibles",
         parse_mode="Markdown",
     )
 
@@ -181,8 +195,8 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "❌ *Échec du téléchargement*\n\n"
                 "💡 *Causes possibles :*\n"
                 "• Vidéo privée ou supprimée\n"
-                "• Pour Facebook/Twitter : connecte-toi dans Chrome/Edge d'abord\n"
-                "• Lien incorrect",
+                "• Pour Facebook/Twitter : connecte-toi dans Chrome/Edge\n"
+                "• Lien incorrect ou vidéo trop longue",
                 parse_mode="Markdown",
             )
             return
@@ -193,9 +207,8 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if file_size_mb > 50:
             await msg.edit_text(
                 f"⚠️ *Vidéo trop grande* ({file_size_mb:.1f} Mo)\n\n"
-                f"Résolution détectée : {resolution}\n"
-                "Telegram limite les fichiers à 50 Mo.\n"
-                "Essaie une vidéo plus courte.",
+                f"Résolution : {resolution}\n"
+                "Telegram limite à 50 Mo. Essaie une vidéo plus courte.",
                 parse_mode="Markdown",
             )
             return
