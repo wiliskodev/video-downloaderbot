@@ -93,51 +93,111 @@ def run_ytdlp(cmd: list, timeout=300) -> bool:
         logger.error(f"yt-dlp exception: {e}")
     return False
 
+def convert_to_mp4(input_path: Path, output_dir: Path) -> Path:
+    """Convertit n'importe quel format vidéo en mp4 avec ffmpeg."""
+    output = output_dir / "converted.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(output)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and output.exists():
+            logger.info(f"✅ Converti en mp4 : {output.stat().st_size / 1024 / 1024:.1f} Mo")
+            return output
+        # Si copy échoue, essayer avec réencodage
+        cmd2 = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            str(output)
+        ]
+        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)
+        if result2.returncode == 0 and output.exists():
+            return output
+    except Exception as e:
+        logger.error(f"Conversion mp4 échouée : {e}")
+    return input_path  # retourner l'original si conversion échoue
+
 def get_cookies_args(platform: str) -> list:
     if platform == "YouTube" and YT_COOKIES_FILE.exists():
         return ["--cookies", str(YT_COOKIES_FILE)]
     elif platform == "Facebook" and FB_COOKIES_FILE.exists():
         return ["--cookies", str(FB_COOKIES_FILE)]
-    elif platform == "Twitter/X":
-        # Twitter/X : essai sans cookies d'abord (souvent public)
-        return []
     return []
 
 def dl_video_only(url: str, output_dir: Path, platform: str) -> Path:
+    """Télécharge la vidéo en HD et force le format mp4."""
     output_file = output_dir / "video.mp4"
     cookies = get_cookies_args(platform)
+
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/bestvideo[ext=mp4]/bestvideo",
+        "--merge-output-format", "mp4",
         "-o", str(output_file),
     ] + cookies + [url]
+
     if run_ytdlp(cmd) and output_file.exists():
         return output_file
+
+    # Chercher tout fichier vidéo créé (au cas où l'extension serait différente)
+    for f in output_dir.iterdir():
+        if f.suffix in (".webm", ".mkv", ".mov", ".avi"):
+            logger.info(f"Conversion {f.suffix} → mp4...")
+            return convert_to_mp4(f, output_dir)
+
     return None
 
 def dl_audio_only(url: str, output_dir: Path, platform: str) -> Path:
-    output_m4a = output_dir / "audio.m4a"
+    """Télécharge l'audio en haute qualité en mp3."""
     output_mp3 = output_dir / "audio.mp3"
     cookies = get_cookies_args(platform)
 
-    # Essai 1 : m4a
+    # On force mp3 pour compatibilité maximale sur mobile
     cmd = [
+        "yt-dlp", "--no-playlist", "--no-warnings",
+        "-f", "bestaudio",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "-o", str(output_mp3),
+    ] + cookies + [url]
+
+    if run_ytdlp(cmd) and output_mp3.exists():
+        return output_mp3
+
+    # Fallback : télécharger m4a et convertir en mp3
+    output_m4a = output_dir / "audio_raw.m4a"
+    cmd2 = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestaudio[ext=m4a]/bestaudio",
         "-o", str(output_m4a),
     ] + cookies + [url]
-    if run_ytdlp(cmd) and output_m4a.exists():
-        return output_m4a
 
-    # Essai 2 : mp3
-    cmd2 = [
-        "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", "bestaudio",
-        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
-        "-o", str(output_mp3),
-    ] + cookies + [url]
-    if run_ytdlp(cmd2) and output_mp3.exists():
-        return output_mp3
+    if run_ytdlp(cmd2) and output_m4a.exists():
+        # Convertir m4a → mp3 avec ffmpeg
+        cmd_conv = [
+            "ffmpeg", "-y",
+            "-i", str(output_m4a),
+            "-codec:a", "libmp3lame",
+            "-qscale:a", "0",
+            str(output_mp3)
+        ]
+        try:
+            result = subprocess.run(cmd_conv, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0 and output_mp3.exists():
+                return output_mp3
+        except Exception as e:
+            logger.error(f"Conversion m4a→mp3 échouée : {e}")
+        return output_m4a  # retourner m4a si conversion échoue
+
     return None
 
 async def send_video_file(update, video_path: Path, platform: str):
@@ -151,7 +211,7 @@ async def send_video_file(update, video_path: Path, platform: str):
     with open(video_path, "rb") as vf:
         await update.message.reply_video(
             video=vf,
-            caption=f"🎥 *Vidéo sans audio* {icon}\n{resolution} — {size_mb:.1f} Mo",
+            caption=f"🎥 *Vidéo HD sans audio* {icon}\n{resolution} — {size_mb:.1f} Mo",
             parse_mode="Markdown",
             supports_streaming=True,
         )
@@ -166,7 +226,7 @@ async def send_audio_file(update, audio_path: Path, platform: str):
     with open(audio_path, "rb") as af:
         await update.message.reply_audio(
             audio=af,
-            caption=f"🔊 *Audio haute qualité* {icon}\n{size_mb:.1f} Mo",
+            caption=f"🔊 *Audio MP3 haute qualité* {icon}\n{size_mb:.1f} Mo",
             parse_mode="Markdown",
         )
 
@@ -174,9 +234,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Video Downloader Bot*\n\n"
         "Envoie-moi un lien et choisis ce que tu veux :\n\n"
-        "🎥 *Vidéo HD* — sans audio\n"
-        "🔊 *Audio seul* — haute qualité\n"
-        "📦 *Vidéo + Audio* — deux fichiers séparés\n\n"
+        "🎥 *Vidéo HD* — format MP4 sans audio\n"
+        "🔊 *Audio seul* — format MP3 haute qualité\n"
+        "📦 *Vidéo + Audio* — MP4 + MP3 séparés\n\n"
         "✅ *Plateformes :*\n"
         "• 🎬 YouTube\n"
         "• 📘 Facebook\n"
@@ -205,9 +265,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     icon = icons.get(platform, "🎬")
 
     keyboard = [
-        [InlineKeyboardButton("🎥 Vidéo HD seulement", callback_data="video_only")],
-        [InlineKeyboardButton("🔊 Audio seulement", callback_data="audio_only")],
-        [InlineKeyboardButton("📦 Vidéo HD + Audio (séparés)", callback_data="both")],
+        [InlineKeyboardButton("🎥 Vidéo HD seulement (MP4)", callback_data="video_only")],
+        [InlineKeyboardButton("🔊 Audio seulement (MP3)", callback_data="audio_only")],
+        [InlineKeyboardButton("📦 Vidéo HD + Audio (MP4 + MP3)", callback_data="both")],
     ]
     await update.message.reply_text(
         f"{icon} *{platform}* détecté !\n\nQue veux-tu télécharger ?",
@@ -231,12 +291,12 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     platform = data["platform"]
     icons = {"YouTube": "🎬", "Facebook": "📘", "Twitter/X": "🐦"}
     icon = icons.get(platform, "🎬")
-
     labels = {
-        "video_only": "🎥 Vidéo HD",
-        "audio_only": "🔊 Audio",
-        "both": "📦 Vidéo + Audio",
+        "video_only": "🎥 Vidéo HD (MP4)",
+        "audio_only": "🔊 Audio (MP3)",
+        "both": "📦 Vidéo + Audio"
     }
+
     await query.edit_message_text(f"⏳ Téléchargement {labels.get(choice)} {icon} en cours...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -247,7 +307,7 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not video:
                 await query.edit_message_text("❌ Échec du téléchargement vidéo.")
                 return
-            await query.edit_message_text("📤 Envoi de la vidéo...")
+            await query.edit_message_text("📤 Envoi de la vidéo MP4...")
             await send_video_file(query, video, platform)
             await query.delete_message()
 
@@ -256,20 +316,18 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not audio:
                 await query.edit_message_text("❌ Échec du téléchargement audio.")
                 return
-            await query.edit_message_text("📤 Envoi de l'audio...")
+            await query.edit_message_text("📤 Envoi de l'audio MP3...")
             await send_audio_file(query, audio, platform)
             await query.delete_message()
 
         elif choice == "both":
-            await query.edit_message_text("⏳ Téléchargement vidéo HD...")
+            await query.edit_message_text("⏳ Téléchargement vidéo HD (MP4)...")
             video = dl_video_only(url, tmp, platform)
-            await query.edit_message_text("⏳ Téléchargement audio...")
+            await query.edit_message_text("⏳ Téléchargement audio (MP3)...")
             audio = dl_audio_only(url, tmp, platform)
-
             if not video and not audio:
                 await query.edit_message_text("❌ Échec du téléchargement.")
                 return
-
             await query.edit_message_text("📤 Envoi des fichiers...")
             if video:
                 await send_video_file(query, video, platform)
