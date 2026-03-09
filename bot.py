@@ -17,6 +17,7 @@ from telegram.ext import (
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "")
+FACEBOOK_COOKIES = os.getenv("FACEBOOK_COOKIES", "")
 
 if not BOT_TOKEN:
     print("❌ Token introuvable dans le fichier .env !")
@@ -38,15 +39,23 @@ SUPPORTED = {
 
 pending_urls = {}
 
-# ── Écrire les cookies dans un fichier temporaire au démarrage ────────────────
-COOKIES_FILE = Path("/tmp/youtube_cookies.txt")
+COOKIES_DIR = Path("/tmp/cookies")
+COOKIES_DIR.mkdir(exist_ok=True)
+YT_COOKIES_FILE = COOKIES_DIR / "youtube.txt"
+FB_COOKIES_FILE = COOKIES_DIR / "facebook.txt"
 
 def setup_cookies():
     if YOUTUBE_COOKIES:
-        COOKIES_FILE.write_text(YOUTUBE_COOKIES)
-        logger.info("✅ Cookies YouTube chargés depuis variable d'environnement")
+        YT_COOKIES_FILE.write_text(YOUTUBE_COOKIES)
+        logger.info("✅ Cookies YouTube chargés")
     else:
-        logger.warning("⚠️ Pas de cookies YouTube — certaines vidéos peuvent échouer")
+        logger.warning("⚠️ Pas de cookies YouTube")
+
+    if FACEBOOK_COOKIES:
+        FB_COOKIES_FILE.write_text(FACEBOOK_COOKIES)
+        logger.info("✅ Cookies Facebook chargés")
+    else:
+        logger.warning("⚠️ Pas de cookies Facebook")
 
 def detect_platform(url: str):
     for domain, name in SUPPORTED.items():
@@ -79,23 +88,20 @@ def run_ytdlp(cmd: list, timeout=300) -> bool:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
             return True
-        logger.error(f"yt-dlp stderr: {result.stderr[:300]}")
+        logger.error(f"yt-dlp stderr: {result.stderr[:400]}")
     except Exception as e:
         logger.error(f"yt-dlp exception: {e}")
     return False
 
 def get_cookies_args(platform: str) -> list:
-    """Retourne les arguments cookies selon la plateforme."""
-    args = []
-    # Cookies fichier pour YouTube
-    if platform == "YouTube" and COOKIES_FILE.exists():
-        args += ["--cookies", str(COOKIES_FILE)]
-    # Cookies navigateur pour Facebook/Twitter
-    elif platform in ("Facebook", "Twitter/X"):
-        for browser in ["chrome", "edge", "firefox"]:
-            args += ["--cookies-from-browser", browser]
-            break
-    return args
+    if platform == "YouTube" and YT_COOKIES_FILE.exists():
+        return ["--cookies", str(YT_COOKIES_FILE)]
+    elif platform == "Facebook" and FB_COOKIES_FILE.exists():
+        return ["--cookies", str(FB_COOKIES_FILE)]
+    elif platform == "Twitter/X":
+        # Twitter/X : essai sans cookies d'abord (souvent public)
+        return []
+    return []
 
 def dl_video_only(url: str, output_dir: Path, platform: str) -> Path:
     output_file = output_dir / "video.mp4"
