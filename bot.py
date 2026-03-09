@@ -44,18 +44,33 @@ COOKIES_DIR.mkdir(exist_ok=True)
 YT_COOKIES_FILE = COOKIES_DIR / "youtube.txt"
 FB_COOKIES_FILE = COOKIES_DIR / "facebook.txt"
 
+def fix_cookies(content: str) -> str:
+    """
+    Railway écrase les vrais sauts de ligne.
+    On remplace les \\n littéraux par de vrais sauts de ligne.
+    """
+    # Remplacer les \n littéraux (2 chars) par de vrais sauts de ligne
+    content = content.replace("\\n", "\n")
+    # Remplacer aussi \t littéraux par de vrais tabs (format cookies.txt)
+    content = content.replace("\\t", "\t")
+    return content
+
 def setup_cookies():
     if YOUTUBE_COOKIES:
-        YT_COOKIES_FILE.write_text(YOUTUBE_COOKIES)
-        logger.info("✅ Cookies YouTube chargés")
+        fixed = fix_cookies(YOUTUBE_COOKIES)
+        YT_COOKIES_FILE.write_text(fixed, encoding="utf-8")
+        lines = [l for l in fixed.splitlines() if l.strip() and not l.startswith("#")]
+        logger.info(f"✅ Cookies YouTube chargés ({len(lines)} entrées)")
     else:
-        logger.warning("⚠️ Pas de cookies YouTube")
+        logger.warning("⚠️ Pas de cookies YouTube configurés")
 
     if FACEBOOK_COOKIES:
-        FB_COOKIES_FILE.write_text(FACEBOOK_COOKIES)
-        logger.info("✅ Cookies Facebook chargés")
+        fixed = fix_cookies(FACEBOOK_COOKIES)
+        FB_COOKIES_FILE.write_text(fixed, encoding="utf-8")
+        lines = [l for l in fixed.splitlines() if l.strip() and not l.startswith("#")]
+        logger.info(f"✅ Cookies Facebook chargés ({len(lines)} entrées)")
     else:
-        logger.warning("⚠️ Pas de cookies Facebook")
+        logger.warning("⚠️ Pas de cookies Facebook configurés")
 
 def detect_platform(url: str):
     for domain, name in SUPPORTED.items():
@@ -94,36 +109,28 @@ def run_ytdlp(cmd: list, timeout=300) -> bool:
     return False
 
 def convert_to_mp4(input_path: Path, output_dir: Path) -> Path:
-    """Convertit n'importe quel format vidéo en mp4 avec ffmpeg."""
     output = output_dir / "converted.mp4"
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        str(output)
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-c:v", "copy", "-c:a", "copy",
+        "-movflags", "+faststart", str(output)
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0 and output.exists():
-            logger.info(f"✅ Converti en mp4 : {output.stat().st_size / 1024 / 1024:.1f} Mo")
             return output
-        # Si copy échoue, essayer avec réencodage
+        # Réencodage si copy échoue
         cmd2 = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            str(output)
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", "-c:a", "aac",
+            "-movflags", "+faststart", str(output)
         ]
         result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)
         if result2.returncode == 0 and output.exists():
             return output
     except Exception as e:
         logger.error(f"Conversion mp4 échouée : {e}")
-    return input_path  # retourner l'original si conversion échoue
+    return input_path
 
 def get_cookies_args(platform: str) -> list:
     if platform == "YouTube" and YT_COOKIES_FILE.exists():
@@ -133,7 +140,6 @@ def get_cookies_args(platform: str) -> list:
     return []
 
 def dl_video_only(url: str, output_dir: Path, platform: str) -> Path:
-    """Télécharge la vidéo en HD et force le format mp4."""
     output_file = output_dir / "video.mp4"
     cookies = get_cookies_args(platform)
 
@@ -147,7 +153,7 @@ def dl_video_only(url: str, output_dir: Path, platform: str) -> Path:
     if run_ytdlp(cmd) and output_file.exists():
         return output_file
 
-    # Chercher tout fichier vidéo créé (au cas où l'extension serait différente)
+    # Chercher si un autre format a été créé et convertir
     for f in output_dir.iterdir():
         if f.suffix in (".webm", ".mkv", ".mov", ".avi"):
             logger.info(f"Conversion {f.suffix} → mp4...")
@@ -156,24 +162,20 @@ def dl_video_only(url: str, output_dir: Path, platform: str) -> Path:
     return None
 
 def dl_audio_only(url: str, output_dir: Path, platform: str) -> Path:
-    """Télécharge l'audio en haute qualité en mp3."""
     output_mp3 = output_dir / "audio.mp3"
     cookies = get_cookies_args(platform)
 
-    # On force mp3 pour compatibilité maximale sur mobile
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
         "-f", "bestaudio",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
+        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
         "-o", str(output_mp3),
     ] + cookies + [url]
 
     if run_ytdlp(cmd) and output_mp3.exists():
         return output_mp3
 
-    # Fallback : télécharger m4a et convertir en mp3
+    # Fallback m4a → mp3
     output_m4a = output_dir / "audio_raw.m4a"
     cmd2 = [
         "yt-dlp", "--no-playlist", "--no-warnings",
@@ -182,13 +184,9 @@ def dl_audio_only(url: str, output_dir: Path, platform: str) -> Path:
     ] + cookies + [url]
 
     if run_ytdlp(cmd2) and output_m4a.exists():
-        # Convertir m4a → mp3 avec ffmpeg
         cmd_conv = [
-            "ffmpeg", "-y",
-            "-i", str(output_m4a),
-            "-codec:a", "libmp3lame",
-            "-qscale:a", "0",
-            str(output_mp3)
+            "ffmpeg", "-y", "-i", str(output_m4a),
+            "-codec:a", "libmp3lame", "-qscale:a", "0", str(output_mp3)
         ]
         try:
             result = subprocess.run(cmd_conv, capture_output=True, text=True, timeout=120)
@@ -196,7 +194,7 @@ def dl_audio_only(url: str, output_dir: Path, platform: str) -> Path:
                 return output_mp3
         except Exception as e:
             logger.error(f"Conversion m4a→mp3 échouée : {e}")
-        return output_m4a  # retourner m4a si conversion échoue
+        return output_m4a
 
     return None
 
