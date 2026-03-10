@@ -169,7 +169,7 @@ def run_ytdlp(cmd: list, timeout=300) -> subprocess.CompletedProcess:
             raise YtdlpError("⏳ Ce live n'a pas encore commencé.", stderr)
 
         if "Requested format is not available" in stderr or "not available" in stderr.lower():
-            raise YtdlpError("⚠️ Format non disponible pour cette vidéo (fallback en cours).", stderr)
+            raise YtdlpError("__format_unavailable__", stderr)
 
         raise YtdlpError("❌ Échec du téléchargement. Réessaie ou vérifie le lien.", stderr)
 
@@ -205,6 +205,8 @@ def get_video_resolution(video_path: Path) -> str:
 
 def _is_fatal_error(e: YtdlpError) -> bool:
     """Retourne True si l'erreur ne vaut pas la peine de retenter (cookies, accès, etc.)"""
+    if e.user_msg == "__format_unavailable__":
+        return False  # Format dispo → on retente avec fallback, silencieusement
     keywords = ["cookies", "privée", "indisponible", "restriction", "live", "valide"]
     return any(k in e.user_msg.lower() for k in keywords)
 
@@ -228,7 +230,7 @@ def dl_full_video(url: str, output_dir: Path, quality: str) -> Path:
         if _is_fatal_error(e):
             raise
 
-    # Tentative 2 : meilleure qualité disponible sans contrainte de codec
+    # Tentative 2 : meilleure qualité sans contrainte de codec (webm, mkv, etc.)
     try:
         run_ytdlp(base_args + ["-f", "bestvideo+bestaudio/best"] + [url])
         if output_file.exists():
@@ -237,8 +239,18 @@ def dl_full_video(url: str, output_dir: Path, quality: str) -> Path:
         if _is_fatal_error(e):
             raise
 
-    # Tentative 3 : fallback absolu
-    run_ytdlp(base_args + ["-f", "best"] + [url])
+    # Tentative 3 : format unique disponible (pas de merge)
+    try:
+        run_ytdlp(base_args + ["-f", "best"] + [url])
+        if output_file.exists():
+            return output_file
+    except YtdlpError as e:
+        if _is_fatal_error(e):
+            raise
+
+    # Tentative 4 : absolument n'importe quel format disponible
+    run_ytdlp(["yt-dlp", "--no-playlist", "--no-warnings", "--no-check-formats",
+               "-o", str(output_file)] + get_cookies_args() + [url])
     if output_file.exists():
         return output_file
 
