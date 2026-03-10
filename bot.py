@@ -37,14 +37,47 @@ def fix_cookies(content: str) -> str:
     """Corrige les sauts de ligne écrasés par Railway."""
     return content.replace("\\n", "\n").replace("\\t", "\t")
 
+def validate_cookies_format(content: str) -> bool:
+    """
+    Vérifie que le fichier cookies est au format Netscape valide.
+    Chaque ligne de données doit avoir exactement 7 champs séparés par des tabs.
+    """
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            logger.warning(f"⚠️ Ligne cookies invalide ({len(fields)} champs au lieu de 7) : {line[:80]}")
+            return False
+    return True
+
 def setup_cookies():
     if YOUTUBE_COOKIES:
         fixed = fix_cookies(YOUTUBE_COOKIES)
+
+        # Validation du format Netscape
+        if not validate_cookies_format(fixed):
+            logger.error(
+                "❌ Format cookies invalide ! "
+                "Le fichier doit être au format Netscape (7 colonnes séparées par des tabs). "
+                "Exporte-les depuis ton navigateur avec l'extension 'Get cookies.txt LOCALLY'."
+            )
+        
+        # Vérifier qu'il y a bien un cookie d'auth YouTube
+        has_auth = any(
+            "SAPISID" in line or "SID" in line or "__Secure-3PSID" in line
+            for line in fixed.splitlines()
+            if not line.startswith("#")
+        )
+        if not has_auth:
+            logger.warning("⚠️ Aucun cookie d'authentification YouTube détecté (SAPISID / SID). Les cookies sont peut-être expirés.")
+
         YT_COOKIES_FILE.write_text(fixed, encoding="utf-8")
         lines = [l for l in fixed.splitlines() if l.strip() and not l.startswith("#")]
         logger.info(f"✅ Cookies YouTube chargés ({len(lines)} entrées)")
     else:
-        logger.warning("⚠️ Pas de cookies YouTube configurés")
+        logger.warning("⚠️ Pas de cookies YouTube configurés — certaines vidéos seront inaccessibles")
 
 def get_cookies_args() -> list:
     if YT_COOKIES_FILE.exists():
@@ -69,17 +102,48 @@ QUALITY_FORMATS = {
     "4K":    "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best",
 }
 
-def run_ytdlp(cmd: list, timeout=300) -> subprocess.CompletedProcess | None:
+class YtdlpError(Exception):
+    """Erreur yt-dlp avec message utilisateur lisible."""
+    def __init__(self, user_msg: str, technical: str = ""):
+        self.user_msg = user_msg
+        self.technical = technical
+        super().__init__(user_msg)
+
+def run_ytdlp(cmd: list, timeout=300) -> subprocess.CompletedProcess:
+    """Lance yt-dlp et lève YtdlpError avec un message lisible en cas d'échec."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
             return result
-        logger.error(f"yt-dlp stderr: {result.stderr[:500]}")
+
+        stderr = result.stderr
+        logger.error(f"yt-dlp stderr: {stderr[:500]}")
+
+        if "Sign in to confirm" in stderr or ("bot" in stderr.lower() and "cookies" in stderr.lower()):
+            raise YtdlpError(
+                "🍪 *Cookies YouTube expirés ou invalides*\n\n"
+                "YouTube demande une authentification.\n"
+                "Le propriétaire du bot doit renouveler les cookies dans les variables d'environnement.",
+                stderr
+            )
+        if "Private video" in stderr:
+            raise YtdlpError("🔒 Cette vidéo est *privée* — impossible de la télécharger.", stderr)
+        if "Video unavailable" in stderr or "This video is unavailable" in stderr:
+            raise YtdlpError("❌ Vidéo *indisponible* dans ta région ou supprimée.", stderr)
+        if "age-restricted" in stderr.lower() or "age restriction" in stderr.lower():
+            raise YtdlpError("🔞 Vidéo avec *restriction d'âge* — des cookies valides sont nécessaires.", stderr)
+        if "This live event will begin" in stderr:
+            raise YtdlpError("⏳ Ce live n'a pas encore commencé.", stderr)
+
+        raise YtdlpError("❌ Échec du téléchargement. Réessaie ou vérifie le lien.", stderr)
+
     except subprocess.TimeoutExpired:
-        logger.error("yt-dlp timeout")
+        raise YtdlpError("⏱️ Délai dépassé — la vidéo est peut-être trop longue ou la connexion trop lente.")
+    except YtdlpError:
+        raise
     except Exception as e:
         logger.error(f"yt-dlp exception: {e}")
-    return None
+        raise YtdlpError("❌ Erreur inattendue lors du téléchargement.")
 
 def get_video_resolution(video_path: Path) -> str:
     try:
@@ -103,8 +167,8 @@ def get_video_resolution(video_path: Path) -> str:
 
 # ─── Téléchargement ───────────────────────────────────────────────────────────
 
-def dl_full_video(url: str, output_dir: Path, quality: str) -> Path | None:
-    """Vidéo + audio fusionnés en un seul MP4."""
+def dl_full_video(url: str, output_dir: Path, quality: str) -> Path:
+    """Vidéo + audio fusionnés en un seul MP4. Lève YtdlpError en cas d'échec."""
     output_file = output_dir / "video_full.mp4"
     fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["1080p"])
     cmd = [
@@ -114,8 +178,14 @@ def dl_full_video(url: str, output_dir: Path, quality: str) -> Path | None:
         "-o", str(output_file),
     ] + get_cookies_args() + [url]
 
-    if run_ytdlp(cmd) and output_file.exists():
-        return output_file
+    try:
+        run_ytdlp(cmd)
+        if output_file.exists():
+            return output_file
+    except YtdlpError as e:
+        # On retente avec fallback seulement si ce n'est PAS un problème de cookies/auth
+        if "cookies" in e.user_msg.lower() or "privée" in e.user_msg or "indisponible" in e.user_msg:
+            raise
 
     # Fallback : meilleur format disponible
     cmd_fallback = [
@@ -125,13 +195,13 @@ def dl_full_video(url: str, output_dir: Path, quality: str) -> Path | None:
         "-o", str(output_file),
     ] + get_cookies_args() + [url]
 
-    if run_ytdlp(cmd_fallback) and output_file.exists():
+    run_ytdlp(cmd_fallback)
+    if output_file.exists():
         return output_file
+    raise YtdlpError("❌ Impossible de télécharger cette vidéo.")
 
-    return None
-
-def dl_video_only(url: str, output_dir: Path, quality: str) -> Path | None:
-    """Vidéo HD sans piste audio."""
+def dl_video_only(url: str, output_dir: Path, quality: str) -> Path:
+    """Vidéo HD sans piste audio. Lève YtdlpError en cas d'échec."""
     output_file = output_dir / "video_only.mp4"
     height = {"720p": 720, "1080p": 1080, "4K": 2160}.get(quality, 1080)
     cmd = [
@@ -141,12 +211,13 @@ def dl_video_only(url: str, output_dir: Path, quality: str) -> Path | None:
         "-o", str(output_file),
     ] + get_cookies_args() + [url]
 
-    if run_ytdlp(cmd) and output_file.exists():
+    run_ytdlp(cmd)
+    if output_file.exists():
         return output_file
-    return None
+    raise YtdlpError("❌ Impossible de télécharger la piste vidéo.")
 
-def dl_audio_only(url: str, output_dir: Path) -> Path | None:
-    """Audio MP3 haute qualité."""
+def dl_audio_only(url: str, output_dir: Path) -> Path:
+    """Audio MP3 haute qualité. Lève YtdlpError en cas d'échec."""
     output_mp3 = output_dir / "audio.mp3"
     cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings",
@@ -155,8 +226,13 @@ def dl_audio_only(url: str, output_dir: Path) -> Path | None:
         "-o", str(output_mp3),
     ] + get_cookies_args() + [url]
 
-    if run_ytdlp(cmd) and output_mp3.exists():
-        return output_mp3
+    try:
+        run_ytdlp(cmd)
+        if output_mp3.exists():
+            return output_mp3
+    except YtdlpError as e:
+        if "cookies" in e.user_msg.lower() or "privée" in e.user_msg or "indisponible" in e.user_msg:
+            raise
 
     # Fallback m4a → mp3
     output_m4a = output_dir / "audio_raw.m4a"
@@ -166,7 +242,8 @@ def dl_audio_only(url: str, output_dir: Path) -> Path | None:
         "-o", str(output_m4a),
     ] + get_cookies_args() + [url]
 
-    if run_ytdlp(cmd2) and output_m4a.exists():
+    run_ytdlp(cmd2)
+    if output_m4a.exists():
         cmd_conv = [
             "ffmpeg", "-y", "-i", str(output_m4a),
             "-codec:a", "libmp3lame", "-qscale:a", "0", str(output_mp3)
@@ -178,8 +255,7 @@ def dl_audio_only(url: str, output_dir: Path) -> Path | None:
         except Exception as e:
             logger.error(f"Conversion m4a→mp3 échouée : {e}")
         return output_m4a
-
-    return None
+    raise YtdlpError("❌ Impossible de télécharger l'audio.")
 
 # ─── Envoi Telegram ───────────────────────────────────────────────────────────
 
@@ -304,38 +380,60 @@ async def _start_download(query, user_id: int):
         tmp = Path(tmpdir)
         message = query.message
 
-        if fmt == "full":
-            video = dl_full_video(url, tmp, quality)
-            if not video:
-                await query.edit_message_text("❌ Échec du téléchargement. Vérifie le lien ou réessaie.")
-                return
-            res = get_video_resolution(video)
-            size_mb = video.stat().st_size / (1024 * 1024)
-            await query.edit_message_text("📤 Envoi en cours...")
-            await send_video(message, video, f"🎬 *Vidéo complète* · {res} · {size_mb:.1f} Mo")
+        try:
+            if fmt == "full":
+                video = dl_full_video(url, tmp, quality)
+                res = get_video_resolution(video)
+                size_mb = video.stat().st_size / (1024 * 1024)
+                await query.edit_message_text("📤 Envoi en cours...")
+                await send_video(message, video, f"🎬 *Vidéo complète* · {res} · {size_mb:.1f} Mo")
 
-        elif fmt == "video":
-            video = dl_video_only(url, tmp, quality)
-            if not video:
-                await query.edit_message_text("❌ Échec du téléchargement vidéo.")
-                return
-            res = get_video_resolution(video)
-            size_mb = video.stat().st_size / (1024 * 1024)
-            await query.edit_message_text("📤 Envoi en cours...")
-            await send_video(message, video, f"🎥 *Vidéo HD seule* (sans audio) · {res} · {size_mb:.1f} Mo")
+            elif fmt == "video":
+                video = dl_video_only(url, tmp, quality)
+                res = get_video_resolution(video)
+                size_mb = video.stat().st_size / (1024 * 1024)
+                await query.edit_message_text("📤 Envoi en cours...")
+                await send_video(message, video, f"🎥 *Vidéo HD seule* (sans audio) · {res} · {size_mb:.1f} Mo")
 
-        elif fmt == "audio":
-            audio = dl_audio_only(url, tmp)
-            if not audio:
-                await query.edit_message_text("❌ Échec du téléchargement audio.")
-                return
-            size_mb = audio.stat().st_size / (1024 * 1024)
-            await query.edit_message_text("📤 Envoi en cours...")
-            await send_audio(message, audio, f"🔊 *Audio MP3* · {size_mb:.1f} Mo")
+            elif fmt == "audio":
+                audio = dl_audio_only(url, tmp)
+                size_mb = audio.stat().st_size / (1024 * 1024)
+                await query.edit_message_text("📤 Envoi en cours...")
+                await send_audio(message, audio, f"🔊 *Audio MP3* · {size_mb:.1f} Mo")
 
-        await query.delete_message()
+            await query.delete_message()
+
+        except YtdlpError as e:
+            logger.error(f"YtdlpError: {e.technical[:200] if e.technical else str(e)}")
+            await query.edit_message_text(e.user_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Erreur inattendue: {e}")
+            await query.edit_message_text("❌ Une erreur inattendue s'est produite. Réessaie.")
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gère les erreurs globales — notamment les conflits d'instances multiples."""
+    from telegram.error import Conflict, NetworkError, TimedOut
+    err = context.error
+
+    if isinstance(err, Conflict):
+        logger.critical(
+            "🚨 CONFLIT : Une autre instance du bot tourne déjà ! "
+            "Arrête toutes les instances sauf une (Railway → redeploy unique)."
+        )
+        return  # Ne pas crasher, juste logguer
+
+    if isinstance(err, TimedOut):
+        logger.warning("⏱️ Timeout réseau Telegram — retente automatiquement.")
+        return
+
+    if isinstance(err, NetworkError):
+        logger.warning(f"🌐 Erreur réseau : {err}")
+        return
+
+    logger.error(f"Erreur non gérée: {err}", exc_info=context.error)
+
 
 def main():
     setup_cookies()
@@ -351,8 +449,14 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(handle_choice))
+    app.add_error_handler(error_handler)
     logger.info("🤖 YouTube Downloader Bot démarré !")
-    app.run_polling(poll_interval=1.0, stop_signals=None)
+    app.run_polling(
+        poll_interval=1.0,
+        stop_signals=None,
+        drop_pending_updates=True,   # Ignore les updates en attente au démarrage
+        allowed_updates=["message", "callback_query"],
+    )
 
 if __name__ == "__main__":
     main()
