@@ -96,10 +96,43 @@ def is_youtube(url: str) -> bool:
 
 # ─── Helpers yt-dlp ───────────────────────────────────────────────────────────
 
+# Formats progressifs : essaie MP4 natif d'abord, puis webm/any, puis fallback total
 QUALITY_FORMATS = {
-    "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "4K":    "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best",
+    "Auto": (
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[ext=mp4]+bestaudio"
+        "/bestvideo+bestaudio"
+        "/best"
+    ),
+    "720p":  (
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=720][ext=mp4]+bestaudio"
+        "/bestvideo[height<=720]+bestaudio"
+        "/best[height<=720]"
+        "/best"
+    ),
+    "1080p": (
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=1080][ext=mp4]+bestaudio"
+        "/bestvideo[height<=1080]+bestaudio"
+        "/best[height<=1080]"
+        "/best"
+    ),
+    "4K": (
+        "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=2160][ext=mp4]+bestaudio"
+        "/bestvideo[height<=2160]+bestaudio"
+        "/bestvideo+bestaudio"
+        "/best"
+    ),
+}
+
+# Formats vidéo seule (sans audio)
+QUALITY_VIDEO_ONLY = {
+    "Auto": "bestvideo[ext=mp4]/bestvideo",
+    "720p":  "bestvideo[height<=720][ext=mp4]/bestvideo[height<=720]/bestvideo",
+    "1080p": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/bestvideo",
+    "4K":    "bestvideo[height<=2160][ext=mp4]/bestvideo[height<=2160]/bestvideo",
 }
 
 class YtdlpError(Exception):
@@ -119,7 +152,7 @@ def run_ytdlp(cmd: list, timeout=300) -> subprocess.CompletedProcess:
         stderr = result.stderr
         logger.error(f"yt-dlp stderr: {stderr[:500]}")
 
-        if "Sign in to confirm" in stderr or ("bot" in stderr.lower() and "cookies" in stderr.lower()):
+        if "Sign in to confirm" in stderr or "cookies" in stderr.lower():
             raise YtdlpError(
                 "🍪 *Cookies YouTube expirés ou invalides*\n\n"
                 "YouTube demande une authentification.\n"
@@ -134,6 +167,9 @@ def run_ytdlp(cmd: list, timeout=300) -> subprocess.CompletedProcess:
             raise YtdlpError("🔞 Vidéo avec *restriction d'âge* — des cookies valides sont nécessaires.", stderr)
         if "This live event will begin" in stderr:
             raise YtdlpError("⏳ Ce live n'a pas encore commencé.", stderr)
+
+        if "Requested format is not available" in stderr or "not available" in stderr.lower():
+            raise YtdlpError("⚠️ Format non disponible pour cette vidéo (fallback en cours).", stderr)
 
         raise YtdlpError("❌ Échec du téléchargement. Réessaie ou vérifie le lien.", stderr)
 
@@ -167,53 +203,71 @@ def get_video_resolution(video_path: Path) -> str:
 
 # ─── Téléchargement ───────────────────────────────────────────────────────────
 
+def _is_fatal_error(e: YtdlpError) -> bool:
+    """Retourne True si l'erreur ne vaut pas la peine de retenter (cookies, accès, etc.)"""
+    keywords = ["cookies", "privée", "indisponible", "restriction", "live", "valide"]
+    return any(k in e.user_msg.lower() for k in keywords)
+
 def dl_full_video(url: str, output_dir: Path, quality: str) -> Path:
     """Vidéo + audio fusionnés en un seul MP4. Lève YtdlpError en cas d'échec."""
     output_file = output_dir / "video_full.mp4"
     fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["1080p"])
-    cmd = [
-        "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", fmt,
+
+    base_args = [
+        "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-formats",
         "--merge-output-format", "mp4",
         "-o", str(output_file),
-    ] + get_cookies_args() + [url]
+    ] + get_cookies_args()
 
+    # Tentative 1 : format qualité demandée
     try:
-        run_ytdlp(cmd)
+        run_ytdlp(base_args + ["-f", fmt] + [url])
         if output_file.exists():
             return output_file
     except YtdlpError as e:
-        # On retente avec fallback seulement si ce n'est PAS un problème de cookies/auth
-        if "cookies" in e.user_msg.lower() or "privée" in e.user_msg or "indisponible" in e.user_msg:
+        if _is_fatal_error(e):
             raise
 
-    # Fallback : meilleur format disponible
-    cmd_fallback = [
-        "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", "best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "-o", str(output_file),
-    ] + get_cookies_args() + [url]
+    # Tentative 2 : meilleure qualité disponible sans contrainte de codec
+    try:
+        run_ytdlp(base_args + ["-f", "bestvideo+bestaudio/best"] + [url])
+        if output_file.exists():
+            return output_file
+    except YtdlpError as e:
+        if _is_fatal_error(e):
+            raise
 
-    run_ytdlp(cmd_fallback)
+    # Tentative 3 : fallback absolu
+    run_ytdlp(base_args + ["-f", "best"] + [url])
     if output_file.exists():
         return output_file
+
     raise YtdlpError("❌ Impossible de télécharger cette vidéo.")
 
 def dl_video_only(url: str, output_dir: Path, quality: str) -> Path:
     """Vidéo HD sans piste audio. Lève YtdlpError en cas d'échec."""
     output_file = output_dir / "video_only.mp4"
-    height = {"720p": 720, "1080p": 1080, "4K": 2160}.get(quality, 1080)
-    cmd = [
-        "yt-dlp", "--no-playlist", "--no-warnings",
-        "-f", f"bestvideo[height<={height}][ext=mp4]/bestvideo[height<={height}]/bestvideo",
+    fmt = QUALITY_VIDEO_ONLY.get(quality, QUALITY_VIDEO_ONLY["1080p"])
+
+    base_args = [
+        "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-formats",
         "--merge-output-format", "mp4",
         "-o", str(output_file),
-    ] + get_cookies_args() + [url]
+    ] + get_cookies_args()
 
-    run_ytdlp(cmd)
+    try:
+        run_ytdlp(base_args + ["-f", fmt] + [url])
+        if output_file.exists():
+            return output_file
+    except YtdlpError as e:
+        if _is_fatal_error(e):
+            raise
+
+    # Fallback : n'importe quelle piste vidéo disponible
+    run_ytdlp(base_args + ["-f", "bestvideo"] + [url])
     if output_file.exists():
         return output_file
+
     raise YtdlpError("❌ Impossible de télécharger la piste vidéo.")
 
 def dl_audio_only(url: str, output_dir: Path) -> Path:
@@ -345,6 +399,7 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # Vidéo : proposer la qualité
         keyboard = [
+            [InlineKeyboardButton("⚡ Auto (meilleure dispo)", callback_data="q_Auto")],
             [InlineKeyboardButton("📱 720p (HD)", callback_data="q_720p")],
             [InlineKeyboardButton("🖥️ 1080p (Full HD)", callback_data="q_1080p")],
             [InlineKeyboardButton("🔥 4K (Ultra HD)", callback_data="q_4K")],
@@ -374,7 +429,8 @@ async def _start_download(query, user_id: int):
     quality = session.get("quality", "1080p")
 
     labels = {"full": "Vidéo complète MP4", "video": "Vidéo HD seule MP4", "audio": "Audio MP3"}
-    await query.edit_message_text(f"⏳ Téléchargement *{labels[fmt]}*{' · ' + quality if fmt != 'audio' else ''}...", parse_mode="Markdown")
+    quality_label = {"Auto": "Auto ⚡", "720p": "720p", "1080p": "1080p", "4K": "4K 🔥"}.get(quality, quality)
+    await query.edit_message_text(f"⏳ Téléchargement *{labels[fmt]}*{' · ' + quality_label if fmt != 'audio' else ''}...", parse_mode="Markdown")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
